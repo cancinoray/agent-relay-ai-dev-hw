@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Unique image tag for this version (e.g. v2-<timestamp>)"
+        required: false
+        default: ""
+
+env:
+  IMAGE_NAME: agent-relay
+  IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@localhost:5432/relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install fastapi "uvicorn[standard]" sqlalchemy pydantic-settings "psycopg[binary]" httpx pytest
+
+      - name: Starter tests against PostgreSQL
+        run: python -m pytest -q
+
+      - name: Integration test against PostgreSQL-backed API
+        env:
+          BASE_URL: http://127.0.0.1:8000
+        run: |
+          python -m uvicorn main:app --port 8000 & 
+          SRV=$!
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+          python scripts/integration_check.py
+          kill $SRV
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kind and kubectl
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+          chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: Build image with unique tag
+        run: docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
+
+      - name: Create kind cluster and load image
+        run: |
+          kind create cluster --name agent-relay --wait 120s
+          kind load docker-image "$IMAGE_NAME:$IMAGE_TAG" --name agent-relay
+
+      - name: Deploy to kind and wait for rollout
+        run: |
+          kubectl apply -f k8s/postgres.yaml -f k8s/agent-relay.yaml
+          kubectl set image deploy/agent-relay api="$IMAGE_NAME:$IMAGE_TAG"
+          kubectl rollout status deploy/agent-relay --timeout=180s
+          kubectl wait --for=condition=ready pod -l app=agent-relay --timeout=120s
+
+      - name: Verify task flow on deployed version
+        env:
+          BASE_URL: http://127.0.0.1:8000
+        run: |
+          kubectl port-forward svc/agent-relay 8000:80 &
+          PF=$!
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+          python scripts/integration_check.py
+          kill $PF
